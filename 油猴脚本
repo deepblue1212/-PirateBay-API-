@@ -1,0 +1,541 @@
+// ==UserScript==
+// @name         豆瓣 PirateBay 助手（API优先增强版）
+// @namespace    http://tampermonkey.net/
+// @version      2.5.5
+// @description  在豆瓣电影/剧集页面智能提取英文名，一键跳转 PirateBay 搜索或直接获取磁力链接（优先API，镜像备用）
+// @author       bleu (优化: assistant)
+// @match        https://movie.douban.com/subject/*
+// @grant        GM_openInTab
+// @grant        GM_xmlhttpRequest
+// @grant        GM_setClipboard
+// @grant        GM_addStyle
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @connect      thepiratebay.org
+// @connect      piratebay.live
+// @connect      pirateproxy.live
+// @connect      tpb.party
+// @connect      apibay.org
+// @connect      omdbapi.com
+// @run-at       document-idle
+// @license      MIT
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    const CONFIG = {
+        PRIMARY_MIRROR: 'thepiratebay.org',
+        FALLBACK_MIRRORS: ['piratebay.live', 'pirateproxy.live', 'tpb.party'],
+        OMDB_API_KEY: 'trilogy',
+        USE_OMDB: true,
+        CACHE_TTL: 3600000,
+        SHOW_FETCH_BUTTON: true,
+        DEBUG: true,
+        API_TIMEOUT: 10000,
+        MIRROR_TIMEOUT: 15000
+    };
+
+    function log(...args) {
+        if (CONFIG.DEBUG) {
+            try { console.log('[PB助手]', ...args); } catch(e) {}
+        }
+    }
+
+    function isDoubanSubjectPage() {
+        return /^https:\/\/movie\.douban\.com\/subject\/\d+\/?/.test(location.href);
+    }
+
+    function getImdbId() {
+        const infoText = document.getElementById('info')?.innerText || '';
+        const match = infoText.match(/tt\d{7,8}/i);
+        return match ? match[0] : null;
+    }
+
+    function fetchEnglishTitleByImdb(imdbId, callback) {
+        const url = `https://www.omdbapi.com/?i=${imdbId}&apikey=${CONFIG.OMDB_API_KEY}`;
+        log('正在通过 OMDb 查询 IMDb ID:', imdbId);
+        GM_xmlhttpRequest({
+            method: 'GET',
+            url: url,
+            timeout: 5000,
+            onload: function(resp) {
+                if (resp.status === 200) {
+                    try {
+                        const data = JSON.parse(resp.responseText);
+                        if (data.Response === 'True' && data.Title) {
+                            log('OMDb 返回精确英文名:', data.Title);
+                            callback(data.Title);
+                            return;
+                        }
+                    } catch (e) {
+                        log('OMDb 解析错误:', e);
+                    }
+                }
+                log('OMDb 查询失败，将使用 DOM 提取结果');
+                callback(null);
+            },
+            onerror: () => callback(null),
+            ontimeout: () => callback(null)
+        });
+    }
+
+    function extractEnglishTitleFromDOM() {
+        const infoSpans = document.querySelectorAll('#info span.pl');
+        for (let span of infoSpans) {
+            const text = span.textContent.trim();
+            if (text.includes('又名') || text.includes('原名')) {
+                let node = span.nextSibling;
+                while (node && node.nodeType !== Node.TEXT_NODE) node = node.nextSibling;
+                if (node) {
+                    const raw = node.textContent.trim();
+                    const aliases = raw.split('/').map(s => s.trim()).filter(s => s);
+                    for (let alias of aliases) {
+                        if (/[a-zA-Z]/.test(alias)) {
+                            log('从又名/原名提取到英文:', alias);
+                            return alias;
+                        }
+                    }
+                    if (aliases.length > 0) return aliases[0];
+                }
+            }
+        }
+        const alternate = document.querySelector('span[property="v:alternateName"]');
+        if (alternate) return alternate.textContent.trim();
+        const titleEl = document.querySelector('h1 span[property="v:itemreviewed"]');
+        if (titleEl) {
+            const match = titleEl.textContent.match(/\(([^)]+)\)/);
+            if (match && match[1] && /[a-zA-Z]/.test(match[1])) return match[1].trim();
+        }
+        const h1 = document.querySelector('h1');
+        if (h1) {
+            const engMatch = h1.textContent.match(/[A-Za-z][A-Za-z\s]+[A-Za-z]/);
+            if (engMatch) return engMatch[0].trim();
+        }
+        return document.querySelector('span[property="v:itemreviewed"]')?.textContent.trim()
+            || document.querySelector('h1')?.textContent.replace(/\([^)]*\)/g, '').trim()
+            || '未命名';
+    }
+
+    function getEnglishTitleAsync(callback) {
+        const imdbId = getImdbId();
+        const domResult = extractEnglishTitleFromDOM();
+        log('DOM提取结果:', domResult, 'IMDb ID:', imdbId);
+        if (imdbId && CONFIG.USE_OMDB) {
+            fetchEnglishTitleByImdb(imdbId, (omdbTitle) => {
+                callback(omdbTitle || domResult);
+            });
+        } else {
+            callback(domResult);
+        }
+    }
+
+    function buildSearchUrl(query, mirror) {
+        return `https://${mirror}/search/${encodeURIComponent(query)}/1/99/0`;
+    }
+
+    // ==================== API 与镜像数据获取 ====================
+
+    function fetchFromApi(query, callback) {
+        const url = `https://apibay.org/q.php?q=${encodeURIComponent(query)}`;
+        log('尝试使用 API 获取数据:', url);
+
+        GM_xmlhttpRequest({
+            method: 'GET',
+            url: url,
+            timeout: CONFIG.API_TIMEOUT,
+            onload: function(resp) {
+                if (resp.status !== 200) {
+                    log('API 请求失败，状态码:', resp.status);
+                    callback(null);
+                    return;
+                }
+
+                try {
+                    const data = JSON.parse(resp.responseText);
+                    if (!Array.isArray(data) || data.length === 0 || data[0].name === 'No results returned') {
+                        log('API 返回空结果或无效数据');
+                        callback(null);
+                        return;
+                    }
+
+                    log('API 成功返回', data.length, '条结果');
+                    const results = data.map(item => ({
+                        title: item.name || '未知标题',
+                        detailUrl: `https://thepiratebay.org/description.php?id=${item.id}`,
+                        magnet: `magnet:?xt=urn:btih:${item.info_hash}&dn=${encodeURIComponent(item.name)}`,
+                        seeders: parseInt(item.seeders, 10) || 0,
+                        leechers: parseInt(item.leechers, 10) || 0,
+                        size: formatBytes(parseInt(item.size, 10)),
+                        date: new Date(parseInt(item.added, 10) * 1000).toLocaleDateString(),
+                        uploader: item.username || '未知'
+                    }));
+                    callback(results.sort((a, b) => b.seeders - a.seeders));
+                } catch (e) {
+                    log('API 数据解析失败:', e);
+                    callback(null);
+                }
+            },
+            onerror: (err) => {
+                log('API 网络错误:', err);
+                callback(null);
+            },
+            ontimeout: () => {
+                log('API 请求超时');
+                callback(null);
+            }
+        });
+    }
+
+    function formatBytes(bytes) {
+        if (isNaN(bytes) || bytes === 0) return '未知';
+        const k = 1024;
+        const sizes = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+        const i = Math.floor(Math.log(bytes) / Math.log(k));
+        return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+    }
+
+    function fetchFromMirror(query, attempt = 0, callback) {
+        const mirrors = [CONFIG.PRIMARY_MIRROR, ...CONFIG.FALLBACK_MIRRORS];
+        if (attempt >= mirrors.length) {
+            log('所有镜像均尝试失败');
+            callback([]);
+            return;
+        }
+
+        const mirror = mirrors[attempt];
+        const url = buildSearchUrl(query, mirror);
+        log(`尝试第 ${attempt + 1} 个镜像: ${mirror}`);
+
+        GM_xmlhttpRequest({
+            method: 'GET',
+            url: url,
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            },
+            timeout: CONFIG.MIRROR_TIMEOUT,
+            onload: function(resp) {
+                if (resp.status !== 200) {
+                    fetchFromMirror(query, attempt + 1, callback);
+                    return;
+                }
+
+                const links = parseSearchResults(resp.responseText, mirror);
+                if (links.length === 0) {
+                    log(`镜像 ${mirror} 解析结果为空`);
+                    fetchFromMirror(query, attempt + 1, callback);
+                } else {
+                    log(`镜像 ${mirror} 成功解析 ${links.length} 条结果`);
+                    callback(links);
+                }
+            },
+            onerror: () => fetchFromMirror(query, attempt + 1, callback),
+            ontimeout: () => fetchFromMirror(query, attempt + 1, callback)
+        });
+    }
+
+    // ==================== 搜索结果解析（原镜像站解析逻辑） ====================
+
+    function parseSearchResults(html, mirror) {
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(html, 'text/html');
+        const results = [];
+
+        const isOfficial = mirror.includes('thepiratebay.org');
+        const isPirateLive = mirror.includes('piratebay.live') || mirror.includes('pirateproxy.live');
+
+        let rows = [];
+
+        if (isOfficial) {
+            const selectors = ['#torrents li.list-entry', '#searchResult li.list-entry', 'li.list-entry', 'table#searchResult tr', 'table tbody tr'];
+            for (let sel of selectors) {
+                const found = doc.querySelectorAll(sel);
+                if (found.length > 0) {
+                    rows = Array.from(found).filter(r => !r.querySelector('th') && !r.classList?.contains('header'));
+                    if (rows.length > 0) break;
+                }
+            }
+        } else if (isPirateLive) {
+            const allRows = doc.querySelectorAll('table#searchResult tr, table tr');
+            rows = Array.from(allRows).filter(row => !row.querySelector('th') && row.querySelector('.detName'));
+        } else {
+            const containers = ['#torrents li.list-entry', '#searchResult tbody tr', 'table#searchResult tr', '.table-list tbody tr'];
+            for (let sel of containers) {
+                const found = doc.querySelectorAll(sel);
+                if (found.length > 0) {
+                    rows = Array.from(found).filter(r => !r.querySelector('th'));
+                    break;
+                }
+            }
+        }
+
+        for (let row of rows) {
+            let title = '', detailUrl = '', magnet = null, seeders = 0, leechers = 0, size = '', date = '';
+
+            if (isOfficial) {
+                const titleLink = row.querySelector('.item-name a') || row.querySelector('.detName a') || row.querySelector('a[href*="/description.php"]');
+                if (titleLink) {
+                    title = titleLink.textContent.trim();
+                    detailUrl = titleLink.href;
+                    if (detailUrl && !detailUrl.startsWith('http')) {
+                        detailUrl = 'https://' + mirror + detailUrl;
+                    }
+                }
+                const magnetEl = row.querySelector('.item-icons a[href^="magnet:"]') || row.querySelector('a[href^="magnet:"]');
+                magnet = magnetEl ? magnetEl.href : null;
+                const seedEl = row.querySelector('.item-seed');
+                const leechEl = row.querySelector('.item-leech');
+                seeders = seedEl ? parseInt(seedEl.textContent.trim(), 10) || 0 : 0;
+                leechers = leechEl ? parseInt(leechEl.textContent.trim(), 10) || 0 : 0;
+                const sizeElement = row.querySelector('.item-size') || row.querySelector('td:nth-child(5)');
+                size = extractSize(sizeElement, mirror);
+                const dateLabel = row.querySelector('.item-uploaded label') || row.querySelector('td:nth-child(2)');
+                date = dateLabel ? (dateLabel.getAttribute('title') || dateLabel.textContent.trim()) : '';
+            } else if (isPirateLive) {
+                const titleLink = row.querySelector('.detName a.detLink');
+                if (titleLink) {
+                    title = titleLink.textContent.trim();
+                    detailUrl = titleLink.href;
+                }
+                const magnetEl = row.querySelector('a[href^="magnet:"]');
+                magnet = magnetEl ? magnetEl.href : null;
+                const tds = row.querySelectorAll('td');
+                if (tds.length >= 4) {
+                    seeders = parseInt(tds[2]?.textContent.trim(), 10) || 0;
+                    leechers = parseInt(tds[3]?.textContent.trim(), 10) || 0;
+                }
+                const sizeElement = row.querySelector('font.detDesc');
+                size = extractSize(sizeElement, mirror);
+                const fontDesc = row.querySelector('font.detDesc');
+                if (fontDesc) {
+                    const dateMatch = fontDesc.textContent.match(/Uploaded\s+([\d\-]+\s*\d{4})/i);
+                    if (dateMatch) date = dateMatch[1].trim();
+                }
+            } else {
+                const titleLink = row.querySelector('.item-name a') || row.querySelector('.detName a.detLink');
+                if (titleLink) {
+                    title = titleLink.textContent.trim();
+                    detailUrl = titleLink.href;
+                }
+                const magnetEl = row.querySelector('a[href^="magnet:"]');
+                magnet = magnetEl ? magnetEl.href : null;
+                const seedEl = row.querySelector('.item-seed') || row.querySelector('td:nth-child(3)');
+                const leechEl = row.querySelector('.item-leech') || row.querySelector('td:nth-child(4)');
+                seeders = seedEl ? parseInt(seedEl.textContent.trim(), 10) || 0 : 0;
+                leechers = leechEl ? parseInt(leechEl.textContent.trim(), 10) || 0 : 0;
+                const sizeElement = row.querySelector('.item-size') || row.querySelector('td:nth-child(5)') || row.querySelector('font.detDesc');
+                size = extractSize(sizeElement, mirror);
+                const dateEl = row.querySelector('.item-uploaded label') || row.querySelector('td:nth-child(2)');
+                if (dateEl) date = dateEl.getAttribute('title') || dateEl.textContent.trim();
+            }
+
+            if (!title) continue;
+
+            results.push({
+                title, detailUrl, magnet, seeders, leechers,
+                size: size || '未知', date: date || ''
+            });
+        }
+
+        return results.sort((a, b) => b.seeders - a.seeders);
+    }
+
+    function extractSize(sizeElement, mirror) {
+        if (!sizeElement) return '';
+        const rawText = sizeElement.textContent || '';
+        const hiddenInput = sizeElement.querySelector('input[name="size"]');
+        if (hiddenInput) {
+            const bytes = parseInt(hiddenInput.value, 10);
+            if (!isNaN(bytes) && bytes > 0) return formatBytes(bytes);
+        }
+        let cleanText = rawText.replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').replace(/^["']|["']$/g, '').trim();
+        const match = cleanText.match(/(?:Size\s*)?(\d+(?:\.\d+)?)\s*(GiB|MiB|KiB|TiB|GB|MB|KB|TB)/i);
+        return match ? match[1] + ' ' + match[2] : (cleanText || '');
+    }
+
+    // ==================== UI 函数 ====================
+
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+
+    function showToast(msg, type = 'info') {
+        const toast = document.createElement('div');
+        toast.className = `pb-toast pb-toast-${type}`;
+        toast.textContent = msg;
+        document.body.appendChild(toast);
+        setTimeout(() => toast.remove(), 3000);
+    }
+
+    function showLoading(show) {
+        const id = 'pb-loading';
+        let el = document.getElementById(id);
+        if (show) {
+            if (!el) {
+                el = document.createElement('div');
+                el.id = id;
+                el.innerHTML = `<div class="pb-loading-overlay"></div><div class="pb-loading-spinner">⏳ 正在从 PirateBay 获取数据...</div>`;
+                document.body.appendChild(el);
+            }
+        } else {
+            if (el) el.remove();
+        }
+    }
+
+    function displayLinksModal(links, originalQuery) {
+        const oldModal = document.getElementById('pb-links-modal');
+        if (oldModal) oldModal.remove();
+
+        const modal = document.createElement('div');
+        modal.id = 'pb-links-modal';
+        modal.innerHTML = `
+            <div class="pb-modal-overlay"></div>
+            <div class="pb-modal-content">
+                <div class="pb-modal-header">
+                    <h3>PirateBay 搜索结果 (${escapeHtml(originalQuery)})</h3>
+                    <div style="display:flex; align-items:center; gap:10px;">
+                        <input type="text" id="pb-search-input" value="${escapeHtml(originalQuery)}" style="padding:4px; width:220px;">
+                        <button id="pb-re-search" class="pb-btn-small">重新搜索</button>
+                        <button class="pb-close-btn">&times;</button>
+                    </div>
+                </div>
+                <div class="pb-modal-body">
+                    ${links.length === 0 ? '<p>未找到相关种子，请尝试修改关键词或切换镜像站。</p>' : ''}
+                    <div class="pb-links-list">
+                        ${links.slice(0, 20).map((item, idx) => `
+                            <div class="pb-link-item">
+                                <div class="pb-link-title">
+                                    <strong>${idx+1}. <a href="${item.detailUrl}" target="_blank">${escapeHtml(item.title)}</a></strong>
+                                    <span class="pb-stats">👍 ${item.seeders}  👎 ${item.leechers}  📦 ${item.size || '未知'}  📅 ${item.date}</span>
+                                </div>
+                                <div class="pb-link-actions">
+                                    ${item.magnet ? `<button class="pb-copy-magnet" data-magnet="${escapeHtml(item.magnet)}">📋 复制磁力</button>` : ''}
+                                    ${item.magnet ? `<span class="pb-magnet-preview">${escapeHtml(item.magnet.substring(0, 80))}…</span>` : ''}
+                                </div>
+                            </div>
+                        `).join('')}
+                    </div>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(modal);
+
+        modal.querySelector('.pb-close-btn').addEventListener('click', () => modal.remove());
+        modal.querySelector('.pb-modal-overlay').addEventListener('click', () => modal.remove());
+
+        modal.querySelector('#pb-re-search').addEventListener('click', () => {
+            const newQuery = modal.querySelector('#pb-search-input').value.trim();
+            if (!newQuery) return;
+            modal.remove();
+            fetchAndDisplayLinks(newQuery);
+        });
+
+        modal.querySelectorAll('.pb-copy-magnet').forEach(btn => {
+            btn.addEventListener('click', function() {
+                GM_setClipboard(this.dataset.magnet, 'text');
+                const originalText = this.textContent;
+                this.textContent = '✅ 已复制';
+                setTimeout(() => this.textContent = originalText, 1500);
+            });
+        });
+    }
+
+    // ==================== 入口：API 优先，镜像备用 ====================
+
+    function fetchAndDisplayLinks(query) {
+        showLoading(true);
+
+        fetchFromApi(query, (apiResults) => {
+            if (apiResults && apiResults.length > 0) {
+                showLoading(false);
+                log('API 成功，直接展示结果');
+                displayLinksModal(apiResults, query);
+            } else {
+                log('API 失败，回退到镜像站');
+                fetchFromMirror(query, 0, (mirrorResults) => {
+                    showLoading(false);
+                    displayLinksModal(mirrorResults, query);
+                });
+            }
+        });
+    }
+
+    // ==================== 按钮初始化 ====================
+
+    function addButtons(englishTitle) {
+        log('添加按钮，搜索词:', englishTitle);
+
+        GM_addStyle(`
+            .pb-btn-container { display: inline-block; margin-left: 10px; vertical-align: middle; }
+            .pb-btn { margin-right: 6px; padding: 4px 12px; background: #00a19b; color: white; border: none; border-radius: 3px; cursor: pointer; font-size: 13px; }
+            .pb-btn:hover { background: #008b85; }
+            .pb-btn-fetch { background: #e67e22; }
+            .pb-btn-fetch:hover { background: #d35400; }
+            .pb-btn-small { padding: 2px 8px; font-size: 12px; background: #ddd; border: none; border-radius: 3px; cursor: pointer; }
+            .pb-modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 9999; }
+            .pb-modal-content { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 800px; max-width: 90vw; max-height: 85vh; background: white; border-radius: 8px; z-index: 10000; display: flex; flex-direction: column; }
+            .pb-modal-header { padding: 16px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center; }
+            .pb-modal-body { padding: 16px; overflow-y: auto; }
+            .pb-link-item { border-bottom: 1px solid #f0f0f0; padding-bottom: 10px; margin-bottom: 10px; }
+            .pb-stats { margin-left: 12px; color: #666; font-size: 13px; }
+            .pb-copy-magnet { background: #3498db; color: white; border: none; padding: 3px 10px; border-radius: 3px; cursor: pointer; }
+            .pb-toast { position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%); background: #333; color: white; padding: 10px 20px; border-radius: 4px; z-index: 10002; }
+            #pb-loading { position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 10001; }
+            .pb-loading-overlay { position: absolute; width: 100%; height: 100%; background: rgba(0,0,0,0.3); }
+            .pb-loading-spinner { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: white; padding: 20px 30px; border-radius: 8px; }
+        `);
+
+        const btnContainer = document.createElement('span');
+        btnContainer.className = 'pb-btn-container';
+
+        const searchBtn = document.createElement('button');
+        searchBtn.className = 'pb-btn';
+        searchBtn.textContent = '🏴‍☠️ PirateBay 搜索';
+        searchBtn.title = `关键词: ${englishTitle}`;
+        searchBtn.addEventListener('click', () => {
+            GM_openInTab(buildSearchUrl(englishTitle, CONFIG.PRIMARY_MIRROR), { active: true });
+        });
+
+        const fetchBtn = document.createElement('button');
+        fetchBtn.className = 'pb-btn pb-btn-fetch';
+        fetchBtn.textContent = '📥 获取磁力链接';
+        fetchBtn.addEventListener('click', () => fetchAndDisplayLinks(englishTitle));
+
+        btnContainer.appendChild(searchBtn);
+        if (CONFIG.SHOW_FETCH_BUTTON) btnContainer.appendChild(fetchBtn);
+
+        const yearSpan = document.querySelector('.year');
+        if (yearSpan) {
+            yearSpan.parentNode.insertBefore(btnContainer, yearSpan.nextSibling);
+        } else {
+            const h1 = document.querySelector('h1');
+            if (h1) h1.appendChild(btnContainer);
+        }
+
+        if (!/[a-zA-Z]/.test(englishTitle)) {
+            showToast(`注意：未提取到英文名，将使用“${englishTitle}”搜索`, 'error');
+        }
+    }
+
+    function init() {
+        if (!isDoubanSubjectPage()) return;
+        log('脚本初始化...');
+        setTimeout(() => {
+            const checkTimer = setInterval(() => {
+                if (document.getElementById('info')) {
+                    clearInterval(checkTimer);
+                    getEnglishTitleAsync((title) => {
+                        log('最终搜索词:', title);
+                        addButtons(title);
+                    });
+                }
+            }, 300);
+            setTimeout(() => clearInterval(checkTimer), 8000);
+        }, 1000);
+    }
+
+    init();
+})();
